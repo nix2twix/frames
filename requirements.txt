@@ -1,0 +1,12 @@
+torch
+torchvision
+facenet-pytorch
+numpy
+pandas
+streamlit
+scikit-learn
+opencv-python
+Pillow
+matplotlib
+adversarial-robustness-toolbox
+plotly
