@@ -16,20 +16,83 @@ from pathlib import Path
 
 # --- CUSTOM LIBS
 from source.models import get_embedder, CustomEmbedder
-from source.attacks import fgsm_embed, pgd_embed, cw_embed, patch_attack_embed
-from source.dataset import load_dataset_from_zip, validate_data_root, get_dataloader
-from source.visualisation import make_diff_heatmap, tensor_to_np01
+from source.attacks import (
+    fgsm_embed, pgd_embed, cw_embed,
+    geometric_attack_embed
+)
+from source.dataset import (
+    load_dataset_from_zip, validate_data_root, get_dataloader
+)
+from source.visualisation import (
+    make_diff_heatmap, tensor_to_np01, draw_face_mesh_on_image
+)
+
+from source.configuration import (
+    ConfigurationError, create_config, load_config, serialize_config,
+)
 from source.metrics import (
     l0_count_per_image, l2_per_image, linf_per_image,
     cosine_similarity_batch, attack_success_rate,
-    confidence_shift, accuracy_drop, predict_identity
+    predict_identity, geometric_delta, _extract_landmarks
 )
 from source.utils import (
     export_metrics_to_csv, export_heatmaps_to_zip, export_adversarial_to_zip,
     save_uploaded_file, export_adversarial_dataset, export_metrics_to_pdf,
-    run_attack_series, export_metrics_to_html, init_session
+    run_attack_series, export_metrics_to_html, init_session, clear_attack_result
 )
 from styles.style import load_styles, load_header
+
+def apply_uploaded_config_general():
+    """Применяет загруженную конфигурацию до создания виджетов."""
+
+    uploaded = st.session_state.get("config_upload_general")
+    if uploaded is None:
+        return
+
+    try:
+        config = load_config(uploaded)
+        attack = config["attack"]
+        scenario = config["scenario"]
+        params = attack["parameters"]
+
+        # Переключаем тип атаки на указанный в конфигурации.
+        st.session_state["attack_type_general"] = attack["type"]
+
+        # Сбрасываем параметры к значениям по умолчанию,
+        # чтобы не сохранялись настройки предыдущей атаки.
+        st.session_state["eps_general"] = params.get("epsilon", 0.08)
+        st.session_state["alpha_general"] = params.get("alpha", 0.01)
+        st.session_state["iters_general"] = (
+            params["iters"] if attack["type"] == "PGD" else 15
+        )
+        st.session_state["c_general"] = params.get("c", 1.0)
+        st.session_state["lr_general"] = params.get("lr", 0.01)
+        st.session_state["iters_cw_general"] = (
+            params["iters"]
+            if attack["type"] == "Carlini-Wagner"
+            else 100
+        )
+        st.session_state["strength_geo"] = params.get("strength", 0.5)
+
+        st.session_state["mode_general"] = (
+            "Подмена личности"
+            if scenario["type"] == "impersonation"
+            else "Обход аутентификации"
+        )
+        st.session_state["thr_general"] = scenario["threshold"]
+
+        st.session_state["loaded_config_general"] = config
+        st.session_state["config_status_general"] = (
+            "success",
+            "Конфигурация загружена и применена."
+        )
+
+    except ConfigurationError as exc:
+        st.session_state["config_status_general"] = (
+            "error",
+            f"Не удалось загрузить конфигурацию: {exc}"
+        )
+
 
 # --- APP CONFIGURATION
 LOG_DIR = Path("logs")
@@ -51,7 +114,7 @@ with col_settings:
     st.markdown("#### ⚙️ Общие настройки")
     model_name = st.radio(
         "Модель:",
-        ["FaceNet", "ArcFace", "MobileNet", "Custom"],
+        ["FaceNet", "Custom"],
         key="model_select",
     )
     use_default = st.toggle("Встроенный датасет", value=True, key="use_default_ds")
@@ -84,7 +147,7 @@ with col_settings:
                 aligned_data = False
             else:
                 st.error(validation["summary"])
-    batch_size = st.slider("Размер батча", 2, 30, 6, key="batch_size_slider")
+    batch_size = st.slider("Размер батча", 2, 30, 10, key="batch_size_slider")
 
     if model_name == "Custom":
         uploaded_weights = st.file_uploader(
@@ -130,6 +193,7 @@ if data_root_valid and st.session_state.get("custom_model") is not None:
         aligned_data,
     )
     if st.session_state.get("_batch_signature") != current_signature:
+        clear_attack_result()
         with st.spinner("Подготовка батча данных..."):
             model = st.session_state["custom_model"]
             loader = get_dataloader(
@@ -140,7 +204,6 @@ if data_root_valid and st.session_state.get("custom_model") is not None:
             )
             imgs, labels = next(iter(loader))
             imgs = imgs.to(device)
-
             st.session_state["imgs"] = imgs
             st.session_state["labels"] = labels
             st.session_state["emb_before"] = model.get_embeddings(imgs)
@@ -155,7 +218,8 @@ with col_general:
             st.markdown("#### Параметры атаки")
             attack_type = st.selectbox(
                 "Тип атаки:",
-                ["FGSM", "PGD", "Carlini-Wagner", "PatchAttack"],
+                ["FGSM", "PGD", "Carlini-Wagner", 
+                "Geometric Attack"],
                 key="attack_type_general",
             )
 
@@ -165,7 +229,6 @@ with col_general:
                 iters = 15
                 c = 1.0
                 lr = 0.01
-                patch_size = 32
 
                 if attack_type == "PGD":
                     alpha = st.slider("Шаг α", 0.001, 0.05, 0.01, key="alpha_general")
@@ -178,14 +241,23 @@ with col_general:
                         format="%.2f", key="c_general",
                         help="Вес CW-лосса. 1.0 — баланс, 10.0 — сильнее атака."
                     )
-                    lr = st.number_input("LR", value=0.01, format="%.3f", key="lr_general")
-                    iters = st.slider("Итераций", 100, 1000, 500, 50, key="iters_cw_general")
-                    
-                elif attack_type == "PatchAttack":
-                    patch_size = st.slider("Размер патча", 8, 128, 64, 8, key="ps_general")
-                    lr = st.number_input("LR", value=0.005, format="%.3f", key="lr_pa_general")
-                    iters = st.slider("Итераций", 10, 500, 300, 50, key="iters_pa_general")
-
+                    lr = st.number_input(
+                        "LR",
+                        value=0.01,
+                        min_value=0.00001,
+                        max_value=1.0,
+                        step=0.001,
+                        format="%.5f",
+                        key="lr_general",
+                    )
+                    iters = st.slider("Итераций", 10, 1000, 100, 10, key="iters_cw_general")
+                
+                elif attack_type == "Geometric Attack":
+                    geo_strength = st.slider(
+                        "Сила деформации", 0.0, 1.0, 0.5, 0.05,
+                        key="strength_geo",
+                        help="0 — без деформации, 1 — полная замена геометрии целью",
+                    )
                 mode = st.selectbox(
                     "Режим атаки", ["Подмена личности", "Обход аутентификации"],
                     key="mode_general",
@@ -193,11 +265,80 @@ with col_general:
                 thr = st.slider("Порог сходства", 0.0, 1.0, 0.5, 0.01, key="thr_general")
 
             run = st.button(
-                "🚀 Запустить атаку",
+                label="🚀 Запустить атаку",
                 width="stretch",
                 disabled=not st.session_state.get("batch_ready", False),
                 key="run_attack_btn",
+                type="primary"
             )
+
+            uploaded_config = st.file_uploader(
+                "Загрузить конфигурацию",
+                type=["json"],
+                key="config_upload_general",
+                on_change=apply_uploaded_config_general,
+            )
+
+            config_status = st.session_state.get(
+                "config_status_general"
+            )
+
+            if config_status is not None:
+                status_type, status_message = config_status
+
+                if status_type == "success":
+                    st.success(status_message)
+                else:
+                    st.error(status_message)
+
+            # Собираем параметры только выбранного метода атаки.
+            if attack_type == "FGSM":
+                current_attack_params = {
+                    "epsilon": epsilon,
+                }
+
+            elif attack_type == "PGD":
+                current_attack_params = {
+                    "epsilon": epsilon,
+                    "alpha": alpha,
+                    "iters": iters,
+                }
+
+            elif attack_type == "Carlini-Wagner":
+                current_attack_params = {
+                    "epsilon": epsilon,
+                    "c": c,
+                    "lr": lr,
+                    "iters": iters,
+                }
+
+            elif attack_type == "Geometric Attack":
+                current_attack_params = {
+                    "strength": geo_strength,
+                }
+
+            scenario_type = (
+                "impersonation"
+                if mode == "Подмена личности"
+                else "deauth"
+            )
+
+            current_config = create_config(
+                attack_type=attack_type,
+                parameters=current_attack_params,
+                scenario_type=scenario_type,
+                threshold=thr,
+            )
+
+            st.download_button(
+                "⬇️ Сохранить конфигурацию",
+                data=serialize_config(current_config),
+                file_name="frames_config.json",
+                mime="application/json",
+                key="download_config_general",
+                width="stretch",
+            )
+
 
         with col2:
             st.markdown("#### 📊 Результаты")
@@ -206,7 +347,6 @@ with col_general:
                 imgs = st.session_state["imgs"]
                 emb_before = st.session_state["emb_before"]
                 labels = st.session_state["labels"]
-
                 emb_gallery = emb_before
                 labels_gallery = labels
 
@@ -215,12 +355,20 @@ with col_general:
                 st.session_state["targets"] = targets
                 st.session_state["emb_targets"] = emb_targets
 
+                geometric_valid = torch.ones(imgs.size(0), dtype=torch.bool, device=imgs.device)
                 t0 = time.time()
                 if attack_type == "FGSM":
-                    adv = fgsm_embed(model, imgs, emb_targets, epsilon, mode.lower())
+                    adv = fgsm_embed(
+                        model, imgs, emb_targets, epsilon,
+                        mode="impersonation" if mode == "Подмена личности" else "deauth"
+                    )
 
                 elif attack_type == "PGD":
-                    adv = pgd_embed(model, imgs, emb_targets, epsilon, alpha, iters, mode.lower())
+                    adv = pgd_embed(
+                        model, imgs, emb_targets, epsilon, alpha, iters,
+                        mode="impersonation" if mode == "Подмена личности" else "deauth",
+                        threshold=thr,
+                    )
                     
                 elif attack_type == "Carlini-Wagner":
                     adv = cw_embed(
@@ -229,15 +377,16 @@ with col_general:
                         lr=lr,
                         iters=iters,
                         epsilon=epsilon,
-                        mode=mode.lower(),
+                        mode="impersonation" if mode == "Подмена личности" else "deauth",
+                        threshold=thr,
                     )
-                elif attack_type == "PatchAttack":
-                    adv = patch_attack_embed(
-                        model, imgs, emb_targets,
-                        patch_size=patch_size,
-                        lr=lr,
-                        iters=iters,
-                        mode=mode.lower(),
+                
+                elif attack_type == "Geometric Attack":
+                    adv, geometric_valid = geometric_attack_embed(
+                        model, imgs, targets,
+                        strength=geo_strength,
+                        mode="impersonation" if mode == "Подмена личности" else "deauth",
+                        return_valid_mask=True,
                     )
                 elapsed = time.time() - t0
 
@@ -255,74 +404,155 @@ with col_general:
 
                 sim_before = cosine_similarity_batch(emb_before, emb_targets)
                 sim_after = cosine_similarity_batch(emb_after, emb_targets)
-                cs_value = confidence_shift(emb_before, emb_after, emb_targets, threshold=thr)
-                acc_clean, acc_adv, ad_value = accuracy_drop(pred_before, labels_np, pred_after)
-                cos_vals = cosine_similarity_batch(emb_before, emb_after)
+                gd_delta = geometric_delta(imgs, adv)
                 l0 = l0_count_per_image(imgs, adv)
                 l2 = l2_per_image(imgs, adv)
                 linf = linf_per_image(imgs, adv)
+
                 success_arr, asr = attack_success_rate(
                     emb_before, emb_after, emb_targets,
                     threshold=thr,
                     mode="impersonation" if mode == "Подмена личности" else "deauth",
                 )
+                # A geometric attack without detectable landmarks is a failed
+                # attack generation, not a valid unchanged adversarial sample.
+                if attack_type == "Geometric Attack":
+                    valid_np = geometric_valid.detach().cpu().numpy().astype(bool)
+                    success_arr = success_arr & valid_np
+                    asr = float(success_arr.sum() / success_arr.size)
+                robustness = 1.0 - asr
 
                 N = imgs.size(0)
-                df = pd.DataFrame({
-                    "L₀": l0, "L₂": l2, "L∞": linf, "Scos": cos_vals,
-                    "Sim_before": sim_before, "Sim_after": sim_after,
-                    "Source": labels_np,
-                    "Target": target_labels,
-                    "Predicted": pred_after,
-                    "Deauth": success_arr,
-                    "Match": pred_after == target_labels,
-                })
+                s_self = cosine_similarity_batch(emb_before, emb_after)
+                delta_s_self = 1.0 - s_self
+                delta_s_target = sim_after - sim_before
 
-                st.session_state.update({
-                    "adv": adv, "emb_after": emb_after, "df": df,
-                    "asr": float(asr), "elapsed": elapsed,
-                    "accuracy_drop": float(ad_value),
-                    "confidence_shift": float(cs_value),
-                    "acc_clean": float(acc_clean), "acc_adv": float(acc_adv),
-                    "metrics": {
-                        "L0": l0, "L2": l2, "L∞": linf, "Scos": cos_vals,
-                        "Cos_target_before": sim_before, "Cos_target_after": sim_after,
-                        "Success": success_arr,
-                        "SourceLabel": labels_np,
-                        "TargetLabel": target_labels,
-                        "PredictedBefore": pred_before,
-                        "PredictedAfter": pred_after,
-                        "MatchTarget": pred_after == target_labels,
-                    },
-                })
-                logging.info(
-                    f"Attack: model={model_name}, attack={attack_type}, mode={mode}, "
-                    f"eps={epsilon}, N={N}, ASR={asr:.4f}, AD={ad_value:.4f}, "
-                    f"Cs={cs_value:.4f}, time={elapsed:.2f}s"
+                valid_np = (
+                    geometric_valid.detach().cpu().numpy()
+                    if attack_type == "Geometric Attack"
+                    else np.ones(N, dtype=bool)
                 )
 
-            if st.session_state.get("adv") is not None:
-                colM1, colM2, colM3 = st.columns([2, 1, 1], vertical_alignment="top")
+                metrics = {
+                    "L0": l0,
+                    "L2": l2,
+                    "Linf": linf,
+
+                    "S": sim_before,
+                    "S_prime": sim_after,
+                    "delta_S": delta_s_target,
+
+                    "S_self": s_self,
+                    "delta_S_self": delta_s_self,
+
+                    "GD": gd_delta,
+
+                    "Success": success_arr,
+
+                    "Source": labels_np,
+                    "Target": target_labels,
+                    "PredictedBefore": pred_before,
+                    "PredictedAfter": pred_after,
+                    "Match": pred_after == target_labels,
+                    "Valid": valid_np,
+                }
+
+                df = pd.DataFrame({
+                    "L₀": l0,
+                    "L₂": l2,
+                    "L∞": linf,
+
+                    "S": sim_before,
+                    "S'": sim_after,
+                    "ΔS": delta_s_target,
+
+                    "S_self": s_self,
+                    "ΔS_self": delta_s_self,
+
+                    "ΔGD": gd_delta,
+
+                    "Source": labels_np,
+                    "Target": target_labels,
+                    "PredictedBefore": pred_before,
+                    "PredictedAfter": pred_after,
+                    "Success": success_arr,
+                    "Match": pred_after == target_labels,
+                    "Valid": valid_np,
+                })
+
+                result_params = {
+                    "attack_type": attack_type,
+                    "mode": mode,
+                    "threshold": thr,
+                }
+
+                if attack_type == "FGSM":
+                    result_params["epsilon"] = epsilon
+
+                elif attack_type == "PGD":
+                    result_params["epsilon"] = epsilon
+                    result_params["alpha"] = alpha
+                    result_params["iters"] = iters
+
+                elif attack_type == "Carlini-Wagner":
+                    result_params["epsilon"] = epsilon
+                    result_params["c"] = c
+                    result_params["lr"] = lr
+                    result_params["iters"] = iters
+
+                elif attack_type == "Geometric Attack":
+                    result_params["strength"] = geo_strength
+
+                st.session_state.update({
+                    "adv": adv,
+                    "targets": targets,
+                    "emb_targets": emb_targets,
+                    "emb_after": emb_after,
+
+                    "metrics": metrics,
+                    "df": df,
+
+                    "asr": asr,
+                    "robustness": robustness,
+                    "elapsed": elapsed,
+
+                    "heatmaps": None,
+
+                    "result_attack_type": attack_type,
+                    "result_mode": mode,
+                    "result_params": result_params,
+                    "result_config": current_config,
+                })
+
+                logging.info(
+                    f"Attack: model={model_name}, attack={attack_type}, mode={mode}, "
+                    f"eps={epsilon}, N={N}, ASR={asr:.4f}"
+                )
+
+            if (
+                st.session_state.get("adv") is not None
+                and st.session_state.get("metrics") is not None
+            ):
+                colM1, colM2 = st.columns([2, 1], vertical_alignment="top")
                 with colM1:
-                    st.markdown(f"Успешность атаки")
-                    asr_val = float(st.session_state["asr"])
-                    asr_pct = max(0.0, min(100.0, asr_val * 100.0))
-                    r, g, b = int(255 * asr_val), int(255 * (1 - asr_val)), 0
+                    rob_val = float(st.session_state["robustness"])
+                    rob_pct = rob_val * 100.0
+                    st.metric("Устойчивость модели", f"")
+                    rob_val = float(st.session_state["robustness"])
+                    rob_pct = max(0.0, min(100.0, rob_val * 100.0))
+                    r, g, b = int(255 * (1 - rob_val)), int(255 * rob_val), 0
                     fill_color = f"rgb({r},{g},{b})"
                     bg_color = "#444"
                     bar_h = 30
                     bar_html = f"""
                     <div style="width:100%; max-width:100%; box-sizing:border-box;">
                     <div style="width:100%; height:{bar_h}px; background:{bg_color}; border-radius:{bar_h/2}px; overflow:hidden; position:relative;">
-                    <div style="height:100%; width:{asr_pct}%; background:{fill_color}; border-radius:{bar_h/2}px;"></div>
+                    <div style="height:100%; width:{rob_pct}%; background:{fill_color}; border-radius:{bar_h/2}px;"></div>
                     <div style="position:absolute;top:0;left:0;width:100%;height:100%;display:flex;align-items:center;justify-content:center;
-                                font-weight:700;color:#fff;text-shadow:0 1px 2px rgba(0,0,0,0.6);pointer-events:none;">{asr_pct:.1f}%</div>
+                                font-weight:700;color:#fff;text-shadow:0 1px 2px rgba(0,0,0,0.6);pointer-events:none;">{rob_pct:.1f}%</div>
                     </div></div>"""
                     st.markdown(bar_html, unsafe_allow_html=True)
-                    st.caption("Attack Success Rate")
                 with colM2:
-                    st.metric("Сдвиг уверенности", f"{float(st.session_state['confidence_shift']):.3f}")
-                with colM3:
                     st.metric("Время атаки", f"{st.session_state['elapsed']:.2f} сек")
 
                 st.dataframe(st.session_state["df"], width="stretch")
@@ -374,56 +604,28 @@ with col_general:
                                 attack_type=attack_type,
                                 epsilon=epsilon,
                                 mode=mode,
-                                sim_before=st.session_state["metrics"]["Cos_target_before"],
-                                sim_after=st.session_state["metrics"]["Cos_target_after"],
+                                sim_before=st.session_state["metrics"]["S"],
+                                sim_after=st.session_state["metrics"]["S_prime"],
                                 success_arr=st.session_state["metrics"]["Success"],
                                 output_dir=tmpdir,
                             )
                         filename = "adversarial_dataset.zip"
 
                     elif export_choice == "Отчёт (.html)":
-                        params = {
-                            "attack_type": attack_type,
-                            "mode": mode,
-                            "epsilon": epsilon,
-                            "alpha": alpha if attack_type == "PGD" else None,
-                            "iters": iters,
-                            "c": c if attack_type == "Carlini-Wagner" else None,
-                            "lr": lr if attack_type in ("Carlini-Wagner", "PatchAttack") else None,
-                            "patch_size": patch_size if attack_type == "PatchAttack" else None,
-                            "thr": thr,
-                        }
-                        params = {k: v for k, v in params.items() if v is not None}
-
+                        params = st.session_state["result_params"]
                         choice_bytes = export_metrics_to_html(
                             st.session_state["metrics"], model_name, attack_type,
                             float(st.session_state["asr"]),
-                            float(st.session_state["accuracy_drop"]),
-                            float(st.session_state["confidence_shift"]),
                             float(st.session_state["elapsed"]),
                             params=params,
                         )
                         filename = "report.html"
 
                     elif export_choice == "Отчёт (.pdf)":
-                        params = {
-                            "attack_type": attack_type,
-                            "mode": mode,
-                            "epsilon": epsilon,
-                            "alpha": alpha if attack_type == "PGD" else None,
-                            "iters": iters,
-                            "c": c if attack_type == "Carlini-Wagner" else None,
-                            "lr": lr if attack_type in ("Carlini-Wagner", "PatchAttack") else None,
-                            "patch_size": patch_size if attack_type == "PatchAttack" else None,
-                            "thr": thr,
-                        }
-                        params = {k: v for k, v in params.items() if v is not None}
-
+                        params = st.session_state["result_params"]
                         choice_bytes = export_metrics_to_pdf(
                             st.session_state["metrics"], model_name, attack_type,
                             float(st.session_state["asr"]),
-                            float(st.session_state["accuracy_drop"]),
-                            float(st.session_state["confidence_shift"]),
                             float(st.session_state["elapsed"]),
                             params=params,
                         )
@@ -448,11 +650,17 @@ with col_general:
                 imgs = st.session_state["imgs"]
                 adv = st.session_state["adv"]
                 targets = st.session_state.get("targets", imgs)
+
+                result_attack_type = st.session_state["result_attack_type"]
+                result_mode = st.session_state["result_mode"]
+                result_metrics = st.session_state["metrics"]
+
                 N = imgs.size(0)
                 n_show = min(8, N)
 
-                is_impersonation = (mode == "Подмена личности")
+                is_impersonation = (result_mode == "Подмена личности")
 
+                # Заголовки
                 if is_impersonation:
                     header_cols = st.columns([1, 1, 1, 1, 0.3])
                     with header_cols[0]: st.markdown("**Оригинал**")
@@ -470,31 +678,80 @@ with col_general:
                 heatmaps = []
                 for i in range(n_show):
                     orig_np = tensor_to_np01(imgs[i])
-                    adv_np = tensor_to_np01(adv[i])
+                    adv_np  = tensor_to_np01(adv[i])
                     target_np = tensor_to_np01(targets[i]) if is_impersonation else None
+
+                    orig_u8 = (np.clip(orig_np, 0, 1) * 255).astype(np.uint8)
+                    adv_u8  = (np.clip(adv_np, 0, 1) * 255).astype(np.uint8)
+                    target_u8 = (np.clip(target_np, 0, 1) * 255).astype(np.uint8) if is_impersonation else None
+
+                    lm_orig = _extract_landmarks(orig_u8)
+                    lm_adv  = _extract_landmarks(adv_u8)
+                    lm_target = _extract_landmarks(target_u8) if is_impersonation else None
+
+                    if lm_orig is not None:
+                        orig_with_mesh = draw_face_mesh_on_image(
+                            orig_np, lm_orig,
+                            color=(0, 255, 0, 255),
+                            line_color=(0, 255, 0, 120),
+                            radius=2,
+                        )
+                    else:
+                        orig_with_mesh = orig_np
+
+                    if lm_adv is not None:
+                        adv_with_mesh = draw_face_mesh_on_image(
+                            adv_np, lm_adv,
+                            color=(255, 0, 0, 255),
+                            line_color=(255, 255, 255, 120),
+                            radius=2,
+                        )
+                    else:
+                        adv_with_mesh = adv_np
+
+                    if is_impersonation and lm_target is not None:
+                        target_with_mesh = draw_face_mesh_on_image(
+                            target_np, lm_target,
+                            color=(0, 150, 255, 255),
+                            line_color=(0, 150, 255, 120),
+                            radius=2,
+                        )
+                    else:
+                        target_with_mesh = target_np
 
                     heatmap = make_diff_heatmap(
                         orig_np, adv_np,
-                        cmap="gray_r",
-                        vmax=epsilon
+                        cmap="inferno",
+                        vmax=epsilon,
+                        blur_radius=1, 
                     )
                     heatmaps.append(heatmap)
 
-                    success = bool(st.session_state["metrics"]["Success"][i])
+                    success = bool(result_metrics["Success"][i])
 
                     if is_impersonation:
                         c1, c2, c3, c4, c5 = st.columns([1, 1, 1, 1, 0.3])
-                        with c1: st.image(orig_np, width="stretch", clamp=True)
-                        with c2: st.image(target_np, width="stretch", clamp=True)
-                        with c3: st.image(adv_np, width="stretch", clamp=True)
+                        with c1: st.image(orig_with_mesh, width="stretch", clamp=True)
+                        with c2: st.image(target_with_mesh, width="stretch", clamp=True)
+                        with c3: st.image(adv_with_mesh, width="stretch", clamp=True)
                         with c4: st.image(np.array(heatmap), width="stretch", clamp=True)
                         with c5: st.markdown("✅" if success else "❌")
                     else:
                         c1, c2, c3, c4 = st.columns([1, 1, 1, 0.3])
-                        with c1: st.image(orig_np, width="stretch", clamp=True)
-                        with c2: st.image(adv_np, width="stretch", clamp=True)
+                        with c1: st.image(orig_with_mesh, width="stretch", clamp=True)
+                        with c2: st.image(adv_with_mesh, width="stretch", clamp=True)
                         with c3: st.image(np.array(heatmap), width="stretch", clamp=True)
                         with c4: st.markdown("✅" if success else "❌")
+
+                    if lm_orig is not None and lm_adv is not None:
+                        from source.metrics import _geometric_descriptors
+                        g_o = _geometric_descriptors(lm_orig)
+                        g_a = _geometric_descriptors(lm_adv)
+                        gd_delta = float(np.mean([
+                            abs(g_a[k] - g_o[k]) / max(g_o[k], 1e-6) for k in g_o
+                        ]))
+
+                    st.markdown("---")
 
                 st.session_state["heatmaps"] = heatmaps
 
@@ -510,13 +767,12 @@ with col_general:
             _container = st.container(horizontal=True, vertical_alignment="bottom")
             with _container:
                 series_attack = st.selectbox(
-                    "Атака:", ["FGSM", "PGD", "Carlini-Wagner", "PatchAttack"], key="series_attack"
+                    "Атака:", ["FGSM", "PGD", "Carlini-Wagner"], key="series_attack"
                 )
                 param_options = {
                     "FGSM": [("epsilon", "ε")],
                     "PGD": [("epsilon", "ε"), ("alpha", "α"), ("iters", "Итераций")],
-                    "Carlini-Wagner": [("epsilon", "ε"), ("c", "c"), ("iters", "Итераций")],
-                    "PatchAttack": [("patch_size", "Размер патча"), ("lr", "LR"), ("iters", "Итераций")],
+                    "Carlini-Wagner": [("epsilon", "ε"), ("c", "c"), ("iters", "Итераций")]
                 }
                 options = param_options[series_attack]
                 chosen_label = st.selectbox(
@@ -534,8 +790,7 @@ with col_general:
                     "alpha":      {"lo": 0.0001,"hi": 0.1,  "default_range": (0.005, 0.05),"default_step": 0.005, "decimals": 4},
                     "iters":      {"lo": 1,     "hi": 1000, "default_range": (50, 500),    "default_step": 50,    "decimals": 0},
                     "c":          {"lo": 0.01,  "hi": 100.0,"default_range": (0.1, 10.0),  "default_step": 0.5,   "decimals": 2},
-                    "lr":         {"lo": 1e-5,  "hi": 1.0,  "default_range": (0.001, 0.05),"default_step": 0.005, "decimals": 4},
-                    "patch_size": {"lo": 8,     "hi": 128,  "default_range": (32, 96),     "default_step": 8,     "decimals": 0},
+                    "lr":         {"lo": 1e-5,  "hi": 1.0,  "default_range": (0.001, 0.05),"default_step": 0.005, "decimals": 4}
                 }
                 spec = PARAM_SPECS[param_name]
 
@@ -554,8 +809,7 @@ with col_general:
                     "alpha":      [0.001, 0.005, 0.01, 0.02, 0.05],
                     "iters":      [5, 10, 25, 50, 100, 200],
                     "c":          [0.1, 0.5, 1.0, 5.0, 10.0, 50.0],
-                    "lr":         [0.001, 0.005, 0.01, 0.02, 0.05],
-                    "patch_size": [1, 2, 4, 8, 16, 32],
+                    "lr":         [0.001, 0.005, 0.01, 0.02, 0.05]
                 }
                 p_step = st.select_slider(
                     f"Шаг {chosen_label}",
@@ -565,7 +819,7 @@ with col_general:
                 )
 
                 p_min, p_max = rng
-                if param_name in ("iters", "patch_size"):
+                if param_name == "iters":
                     p_min = int(p_min)
                     p_max = int(p_max)
                     p_step = int(p_step)
@@ -575,11 +829,9 @@ with col_general:
                 }
 
                 if series_attack == "Carlini-Wagner":
-                    defaults = {"epsilon": 0.08, "alpha": 0.01, "iters": 500, "c": 1.0, "lr": 0.01, "patch_size": 32}
-                elif series_attack == "PatchAttack":
-                    defaults = {"epsilon": 0.08, "alpha": 0.01, "iters": 300, "c": 1.0, "lr": 0.005, "patch_size": 64}
+                    defaults = {"epsilon": 0.08, "alpha": 0.01, "iters": 500, "c": 1.0, "lr": 0.01}
                 else:
-                    defaults = {"epsilon": 0.08, "alpha": 0.01, "iters": 15, "c": 1.0, "lr": 0.01, "patch_size": 32}
+                    defaults = {"epsilon": 0.08, "alpha": 0.01, "iters": 15, "c": 1.0, "lr": 0.01}
 
                 _container = st.container(horizontal=True, vertical_alignment="bottom")
                 with _container:
@@ -589,10 +841,6 @@ with col_general:
                                 fixed_params[key] = st.number_input(
                                     f"{key}", value=int(val), min_value=1, max_value=1000, key=f"fix_{key}"
                                 )
-                            elif key == "patch_size":
-                                fixed_params[key] = st.number_input(
-                                    f"{key}", value=int(val), min_value=4, max_value=128, key=f"fix_{key}"
-                                )
                             else:
                                 fixed_params[key] = st.number_input(
                                     f"{key}", value=float(val), format="%.4f", key=f"fix_{key}"
@@ -600,7 +848,7 @@ with col_general:
 
         with colS2:
             st.markdown("#### 📊 Результаты")
-            if param_name in ("iters", "patch_size"):
+            if param_name == "iters":
                 param_values = list(range(int(p_min), int(p_max) + 1, int(p_step)))
             else:
                 param_values = np.arange(p_min, p_max + 1e-12, p_step).tolist()
@@ -637,9 +885,23 @@ with col_general:
                 x_label = st.session_state.get("series_param_label", "Параметр")
                 with st.expander(f"Метрики устойчивости", expanded=True):
                     fig1 = go.Figure()
-                    fig1.add_trace(go.Scatter(x=x, y=results["ASR"], name="ASR", mode="lines+markers"))
-                    fig1.add_trace(go.Scatter(x=x, y=results["AD"], name="Accuracy Drop", mode="lines+markers"))
-                    fig1.add_trace(go.Scatter(x=x, y=results["CS"], name="Confidence Shift", mode="lines+markers"))
+                    fig1.add_trace(
+                        go.Scatter(
+                            x=x,
+                            y=results["Robustness"],
+                            name="Устойчивость",
+                            mode="lines+markers",
+                        )
+                    )
+
+                    fig1.add_trace(
+                        go.Scatter(
+                            x=x,
+                            y=results["ASR"],
+                            name="ASR",
+                            mode="lines+markers",
+                        )
+                    )
                     fig1.update_layout(
                         xaxis_title=x_label, yaxis_title="Значение",
                         height=450, hovermode="x unified",
@@ -647,8 +909,32 @@ with col_general:
                     st.plotly_chart(fig1, width="stretch")
                 with st.expander(f"Метрики искажения", expanded=False):
                     fig2 = go.Figure()
-                    fig2.add_trace(go.Scatter(x=x, y=results["Linf_mean"], name="L∞", mode="lines+markers"))
-                    fig2.add_trace(go.Scatter(x=x, y=results["L2_mean"], name="L2", mode="lines+markers"))
+                    fig2.add_trace(
+                        go.Scatter(
+                            x=x,
+                            y=results["L0_mean"],
+                            name="L₀",
+                            mode="lines+markers",
+                        )
+                    )
+
+                    fig2.add_trace(
+                        go.Scatter(
+                            x=x,
+                            y=results["L2_mean"],
+                            name="L₂",
+                            mode="lines+markers",
+                        )
+                    )
+
+                    fig2.add_trace(
+                        go.Scatter(
+                            x=x,
+                            y=results["Linf_mean"],
+                            name="L∞",
+                            mode="lines+markers",
+                        )
+                    )
                     fig2.update_layout(
                         xaxis_title=x_label, yaxis_title="Значение",
                         height=450, hovermode="x unified",
@@ -656,9 +942,34 @@ with col_general:
                     st.plotly_chart(fig2, width="stretch")
                 with st.expander(f"Косинусное сходство", expanded=False):
                     fig3 = go.Figure()
-                    fig3.add_trace(go.Scatter(x=x, y=results["Scos_mean"], name="Scos", mode="lines+markers"))
+                    fig3.add_trace(
+                        go.Scatter(
+                            x=x,
+                            y=results["S_mean"],
+                            name="S",
+                            mode="lines+markers",
+                        )
+                    )
+
+                    fig3.add_trace(
+                        go.Scatter(
+                            x=x,
+                            y=results["S_prime_mean"],
+                            name="S'",
+                            mode="lines+markers",
+                        )
+                    )
+
+                    fig3.add_trace(
+                        go.Scatter(
+                            x=x,
+                            y=results["delta_S_mean"],
+                            name="ΔS",
+                            mode="lines+markers",
+                        )
+                    )
                     fig3.update_layout(
-                        xaxis_title=x_label, yaxis_title="Scos", height=400,
+                        xaxis_title=x_label, yaxis_title="Сходство с целью", height=400,
                     )
                     st.plotly_chart(fig3, width="stretch")
                 st.dataframe(pd.DataFrame(results), width="stretch")

@@ -2,7 +2,6 @@
 import torch
 import torch.nn as nn
 from facenet_pytorch import InceptionResnetV1
-import torchvision.models as models
 import os
 import sys
 import importlib.util
@@ -23,41 +22,6 @@ class FaceNetEmbedder(nn.Module):
         with torch.no_grad():
             return self.model(x)
 
-# ---------------------------
-# ArcFace (ResNet50)
-# ---------------------------
-class ArcFaceEmbedder(nn.Module):
-    def __init__(self, device=None):
-        super().__init__()
-        self.device = device or ('cuda' if torch.cuda.is_available() else 'cpu')
-        base = models.resnet50(weights=models.ResNet50_Weights.IMAGENET1K_V1)
-        base.fc = nn.Identity()
-        self.model = base.eval().to(self.device)
-
-    def forward(self, x):
-        return self.model(x)
-
-    def get_embeddings(self, x):
-        with torch.no_grad():
-            return self.model(x)
-
-# ---------------------------
-# MobileNetV3-small
-# ---------------------------
-class MobileNetEmbedder(nn.Module):
-    def __init__(self, device=None):
-        super().__init__()
-        self.device = device or ('cuda' if torch.cuda.is_available() else 'cpu')
-        base = models.mobilenet_v3_small(weights=models.MobileNet_V3_Small_Weights.IMAGENET1K_V1)
-        base.classifier = nn.Identity()
-        self.model = base.eval().to(self.device)
-
-    def forward(self, x):
-        return self.model(x)
-
-    def get_embeddings(self, x):
-        with torch.no_grad():
-            return self.model(x)
 
 # ---------------------------
 # Универсальный выбор модели
@@ -66,10 +30,6 @@ def get_embedder(model_name: str, device=None):
     name = model_name.lower()
     if name == "facenet":
         return FaceNetEmbedder(device=device)
-    elif name == "arcface":
-        return ArcFaceEmbedder(device=device)
-    elif name == "mobilenet":
-        return MobileNetEmbedder(device=device)
     else:
         raise ValueError(f"Unknown model {model_name}")
 

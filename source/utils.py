@@ -14,17 +14,69 @@ from source.visualisation import tensor_to_np01
 def init_session():
     if "session_initialized" not in st.session_state:
         st.session_state.update({
-            "imgs": None, "labels": None, "targets": None, "emb_targets": None,
-            "custom_model": None, "_cached_model_name": None,
-            "adv": None, "emb_before": None, "emb_after": None,
-            "heatmaps": None, "metrics": None, "df": None,
-            "asr": None, "elapsed": None,
-            "accuracy_drop": None, "confidence_shift": None,
-            "acc_clean": None, "acc_adv": None,
-            "dataset_root": None, "batch_ready": False, "_batch_signature": None,
-            "series_results": None, "series_param_name": None, "series_param_label": None,
-            "session_initialized": True
+            # Текущий батч
+            "imgs": None,
+            "labels": None,
+            "emb_before": None,
+
+            # Загруженная модель
+            "custom_model": None,
+            "_cached_model_name": None,
+
+            # Результат последней атаки
+            "adv": None,
+            "targets": None,
+            "emb_targets": None,
+            "emb_after": None,
+
+            # Результаты и метрики
+            "metrics": None,
+            "df": None,
+            "asr": None,
+            "robustness": None,
+            "elapsed": None,
+            "heatmaps": None,
+
+            # Параметры выполненного запуска
+            "result_attack_type": None,
+            "result_mode": None,
+            "result_params": None,
+            "result_config": None,
+
+            # Данные
+            "dataset_root": None,
+            "batch_ready": False,
+            "_batch_signature": None,
+
+            # Серия экспериментов
+            "series_results": None,
+            "series_param_name": None,
+            "series_param_label": None,
+
+            "session_initialized": True,
         })
+
+def clear_attack_result():
+    """Сбрасывает только результат последней атаки."""
+    st.session_state.update({
+        "adv": None,
+        "targets": None,
+        "emb_targets": None,
+        "emb_after": None,
+
+        "metrics": None,
+        "df": None,
+        "asr": None,
+        "robustness": None,
+        "elapsed": None,
+        "heatmaps": None,
+
+        "result_attack_type": None,
+        "result_mode": None,
+        "result_params": None,
+        "result_config": None,
+    })
+
 
 def export_metrics_to_csv(metrics: dict) -> bytes:
     """
@@ -222,8 +274,11 @@ def run_attack_series(
     from stqdm import stqdm
     from source.attacks import fgsm_embed, pgd_embed, cw_embed, patch_attack_embed
     from source.metrics import (
-        attack_success_rate, accuracy_drop, confidence_shift,
-        linf_per_image, l2_per_image, cosine_similarity_batch,
+        attack_success_rate,
+        linf_per_image,
+        l2_per_image,
+        l0_count_per_image,
+        cosine_similarity_batch,
     )
 
     emb_before = model.get_embeddings(imgs)
@@ -232,8 +287,22 @@ def run_attack_series(
     a_mode = "impersonation" if mode == "Подмена личности" else "deauth"
 
     results = {
-        "param": [], "ASR": [], "AD": [], "CS": [],
-        "Linf_mean": [], "L2_mean": [], "Scos_mean": [], "time": [],
+        "param": [],
+        "ASR": [],
+        "Robustness": [],
+
+        "L0_mean": [],
+        "L2_mean": [],
+        "Linf_mean": [],
+
+        "S_mean": [],
+        "S_prime_mean": [],
+        "delta_S_mean": [],
+
+        "S_self_mean": [],
+        "delta_S_self_mean": [],
+
+        "time": [],
     }
 
     total = len(param_values)
@@ -257,12 +326,6 @@ def run_attack_series(
                            c=params.get("c", 1e-2), lr=params.get("lr", 0.01),
                            iters=int(params.get("iters", 50)), mode=mode.lower(),
                            show_progress=False)
-        elif attack_type == "PatchAttack":
-            adv = patch_attack_embed(model, imgs, emb_targets,
-                                     patch_size=int(params.get("patch_size", 32)),
-                                     lr=params.get("lr", 0.01),
-                                     iters=int(params.get("iters", 100)),
-                                     mode=mode.lower(), show_progress=False)
         else:
             raise ValueError(f"Неизвестный тип атаки: {attack_type}")
 
@@ -270,20 +333,41 @@ def run_attack_series(
         emb_after = model.get_embeddings(adv)
         sim_after = cosine_similarity_batch(emb_after, emb_targets)
 
-        _, asr = attack_success_rate(emb_before, emb_after, emb_targets, threshold=thr, mode=a_mode)
-        _, _, ad = accuracy_drop(sim_before, sim_after, threshold=thr)
-        cs = confidence_shift(emb_before, emb_after, emb_targets, threshold=thr)
-        linf = float(linf_per_image(imgs, adv).mean())
+        _, asr = attack_success_rate(
+            emb_before,
+            emb_after,
+            emb_targets,
+            threshold=thr,
+            mode=a_mode,
+        )
+
+        robustness = 1.0 - asr
+
+        l0 = float(l0_count_per_image(imgs, adv).mean())
         l2 = float(l2_per_image(imgs, adv).mean())
-        scos = float(cosine_similarity_batch(emb_before, emb_after).mean())
+        linf = float(linf_per_image(imgs, adv).mean())
+
+        sim_after = cosine_similarity_batch(emb_after, emb_targets)
+        delta_s = sim_after - sim_before
+
+        s_self = cosine_similarity_batch(emb_before, emb_after)
+        delta_s_self = 1.0 - s_self
 
         results["param"].append(float(value))
         results["ASR"].append(float(asr))
-        results["AD"].append(float(ad))
-        results["CS"].append(float(cs))
-        results["Linf_mean"].append(linf)
+        results["Robustness"].append(float(robustness))
+
+        results["L0_mean"].append(l0)
         results["L2_mean"].append(l2)
-        results["Scos_mean"].append(scos)
+        results["Linf_mean"].append(linf)
+
+        results["S_mean"].append(float(sim_before.mean()))
+        results["S_prime_mean"].append(float(sim_after.mean()))
+        results["delta_S_mean"].append(float(delta_s.mean()))
+
+        results["S_self_mean"].append(float(s_self.mean()))
+        results["delta_S_self_mean"].append(float(delta_s_self.mean()))
+
         results["time"].append(elapsed)
 
         if show_progress:
@@ -294,7 +378,7 @@ def run_attack_series(
 
     return results
 
-def export_metrics_to_html(metrics, model_name, attack_type, asr, ad, cs, elapsed, params=None):
+def export_metrics_to_html(metrics, model_name, attack_type, asr, elapsed, params=None):
     df = pd.DataFrame(metrics)
 
     params_html = ""
@@ -324,18 +408,16 @@ def export_metrics_to_html(metrics, model_name, attack_type, asr, ad, cs, elapse
     <h1>Отчёт FRAMES</h1>
     <p><b>Модель:</b> {model_name}</p>
     <p><b>Атака:</b> {attack_type}</p>
-    <p><b>ASR:</b> <span class="metric">{asr*100:.1f}%</span></p>
-    <p><b>Accuracy Drop:</b> {ad*100:.1f} п.п.</p>
-    <p><b>Confidence Shift:</b> {cs:.3f}</p>
+    <p><b>Устойчивость:</b> <span class="metric">{(1-asr)*100:.1f}%</span></p>
     <p><b>Время:</b> {elapsed:.2f} с</p>
     {params_html}
-    <h2>Метрики по изображениям</h2>
+    <h2>Показатели по изображениям</h2>
     {df.to_html(index=False)}
     </body></html>"""
     return html.encode("utf-8")
 
 
-def export_metrics_to_pdf(metrics, model_name, attack_type, asr, ad, cs, elapsed, params=None):
+def export_metrics_to_pdf(metrics, model_name, attack_type, asr, elapsed, params=None):
     """
     Генерирует PDF-отчет
     """
@@ -357,13 +439,12 @@ def export_metrics_to_pdf(metrics, model_name, attack_type, asr, ad, cs, elapsed
     pdf.cell(0, 10, "FRAMES Report", new_x="LMARGIN", new_y="NEXT", align="C")
     pdf.ln(5)
 
-    # --- Сводные метрики ---
+    # --- Сводные показатели ---
     pdf.set_font("DejaVu", size=11)
     pdf.cell(0, 8, f"Модель: {model_name}   |   Атака: {attack_type}", 
              new_x="LMARGIN", new_y="NEXT")
     pdf.cell(0, 8, 
-             f"ASR: {asr*100:.1f}%   |   Accuracy Drop: {ad*100:.1f} п.п.   |   "
-             f"Confidence Shift: {cs:.3f}", 
+             f"Устойчивость: {(1-asr)*100:.1f}%", 
              new_x="LMARGIN", new_y="NEXT")
     pdf.cell(0, 8, f"Время выполнения: {elapsed:.2f} с", 
              new_x="LMARGIN", new_y="NEXT")
@@ -378,7 +459,7 @@ def export_metrics_to_pdf(metrics, model_name, attack_type, asr, ad, cs, elapsed
             pdf.cell(0, 6, f"  {k}: {v}", new_x="LMARGIN", new_y="NEXT")
         pdf.ln(5)
 
-    # --- Таблица метрик ---
+    # --- Таблица показателей ---
     pdf.set_font("DejaVu", "B", 8)
     columns = list(metrics.keys())
     col_width = min(270 / len(columns), 30)  

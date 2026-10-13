@@ -10,3 +10,4 @@ Pillow
 matplotlib
 adversarial-robustness-toolbox
 plotly
+mediapipe
